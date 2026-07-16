@@ -1,0 +1,11 @@
+# 编译产物
+tinyqwen
+*.o
+*.so
+*.a
+example-static
+example-shared
+
+# 模型文件（体积大，不入库）
+models/
+*.gguf
