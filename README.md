@@ -39,8 +39,10 @@ make examples   # 库用法示例: example-static / example-shared
 ```bash
 gcc -O2 -std=c99 -o tinyqwen tinyqwen.c -lm -pthread     # Linux / macOS
 gcc -O2 -o tinyqwen.exe tinyqwen.c                      # Windows (MinGW)
-cl /O2 tinyqwen.c                                       # Windows (MSVC)
+cl /O2 /utf-8 tinyqwen.c                                # Windows (MSVC)
 ```
+
+（MSVC 的 `/utf-8` 不能省：源码为 UTF-8 编码，MSVC 默认按系统代码页解析。）
 
 SIMD 无需编译开关：AVX2 内核用按函数的目标属性编译，运行时检测启用。
 

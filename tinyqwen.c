@@ -52,8 +52,9 @@
  * ===========================================================================
  */
 
-/* 启用 POSIX.1-2008 接口(clock_gettime / getline / mmap 等)。
- * -std=c99 严格模式下 glibc 默认隐藏这些声明, 需显式声明特性宏。 */
+/* 启用 POSIX.1-2008 接口(clock_gettime / mmap / pthread 等)。
+ * -std=c99 严格模式下 glibc 默认隐藏这些声明, 需显式声明特性宏。
+ * Windows 下该宏无意义也无害(平台相关代码见下方 _WIN32 分支)。 */
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
@@ -76,6 +77,11 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+/* 旧版 MSVC 的 C 模式(未指定 /std:c11)不认识 inline 关键字 */
+#if defined(_MSC_VER) && !defined(__cplusplus) && \
+    (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L)
+#define inline __inline
+#endif
 #else
 #include <fcntl.h>    /* open       */
 #include <unistd.h>   /* close      */
@@ -572,9 +578,11 @@ static int gguf_open(Gguf *out, const char *path) {
 #ifdef _WIN32
     FILE *f = fopen(path, "rb");
     if (!f) return fail("无法打开模型文件: %s", path);
-    fseek(f, 0, SEEK_END);
+    /* 用 64 位定位接口, 普通 fseek 的 long 偏移在 Windows 上是 32 位,
+     * 处理不了 >2GB 的模型文件 */
+    _fseeki64(f, 0, SEEK_END);
     long long sz = _ftelli64(f);
-    fseek(f, 0, SEEK_SET);
+    _fseeki64(f, 0, SEEK_SET);
     if (sz <= 0) { fclose(f); return fail("无法获取模型文件大小"); }
     g.size = (size_t)sz;
     uint8_t *buf = malloc(g.size);
@@ -850,7 +858,7 @@ static int strmap_init(StrMap *m, uint32_t cap_pow2) {
     m->vals = malloc(cap_pow2 * sizeof(int32_t));
     m->mask = cap_pow2 - 1;
     if (!m->keys || !m->vals) {
-        free(m->keys); free(m->vals);
+        free((void *)m->keys); free(m->vals);
         m->keys = NULL; m->vals = NULL;
         return fail("内存不足(分词哈希表)");
     }
@@ -996,15 +1004,15 @@ bad:
     return -1;
 }
 
-/* 释放分词器全部内存 */
+/* 释放分词器全部内存(keys 的 const 强转: MSVC 对 free 有限定符警告) */
 static void tok_free(Tokenizer *t) {
     free(t->vocab);
     free(t->token_type);
     free(t->arena_vocab);
     free(t->arena_merges);
-    free(t->vocab_map.keys);
+    free((void *)t->vocab_map.keys);
     free(t->vocab_map.vals);
-    free(t->merge_map.keys);
+    free((void *)t->merge_map.keys);
     free(t->merge_map.vals);
     memset(t, 0, sizeof(*t));
 }
@@ -2124,11 +2132,20 @@ static void kernel_selftest(const Gguf *g) {
 
 #endif /* TINYQWEN_LIB: 命令行专属段结束 */
 
-/* 单调时钟毫秒数(计时统计用) */
+/* 单调时钟毫秒数(计时统计用)。
+ * clock_gettime 是 POSIX 接口, MSVC 没有, Windows 分支用性能计数器。 */
 static double now_ms(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;              /* 计数器频率, 只查询一次 */
+    LARGE_INTEGER t;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+#endif
 }
 
 /* 把字符串 BPE 编码后追加到 token 数组尾部, 返回新的元素个数。
@@ -2584,6 +2601,29 @@ float tq_rerank(TqModel *m, const char *query, const char *document,
  */
 #ifndef TINYQWEN_LIB
 
+/* 读取一行输入(任意长度), 返回 malloc 的字符串(已去掉行尾换行/回车),
+ * EOF 且无内容时返回 NULL。
+ * 不用 POSIX 的 getline —— Windows(MSVC) 没有该函数和 ssize_t 类型。 */
+static char *read_line(FILE *f) {
+    size_t cap = 256, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    int ch;
+    while ((ch = fgetc(f)) != EOF && ch != '\n') {
+        if (len + 2 > cap) {
+            cap *= 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); return NULL; }
+            buf = nb;
+        }
+        buf[len++] = (char)ch;
+    }
+    if (ch == EOF && len == 0) { free(buf); return NULL; }
+    while (len > 0 && buf[len - 1] == '\r') len--;  /* Windows 的 \r\n */
+    buf[len] = 0;
+    return buf;
+}
+
 /* 命令行的流式输出回调: 原样写到终端 */
 static int cli_on_token(const char *piece, int len, void *ud) {
     (void)ud;
@@ -2692,6 +2732,12 @@ static Options parse_args(int argc, char **argv) {
 int main(int argc, char **argv) {
     Options opt = parse_args(argc, argv);
 
+#ifdef _WIN32
+    /* Windows 控制台默认代码页不是 UTF-8, 中文输出会乱码 */
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+
     /* 进程级运行时初始化(线程池/SIMD 检测/f16 表), 与库 API 共用。
      * 线程数: -j 显式指定, 或自动取 min(核数, 32) —— matvec 行数只有
      * 1~3 千, 线程更多时每份工作变小、同步开销占比上升, 收益递减。 */
@@ -2793,31 +2839,30 @@ int main(int argc, char **argv) {
      * 多轮对话依靠 KV 缓存延续: 每轮只把新增的 token 喂给模型,
      * 历史内容的注意力状态都保存在缓存里, 模型能"记住"前文。 */
     printf("\n进入交互模式: 输入问题回车提问; /clear 清空对话; /exit 或 Ctrl-D 退出\n");
-    char  *line = NULL;
-    size_t lcap = 0;
     for (;;) {
         printf("\n用户> ");
         fflush(stdout);
-        ssize_t len = getline(&line, &lcap, stdin);
-        if (len < 0) { printf("\n再见!\n"); break; }          /* Ctrl-D / EOF */
+        char *line = read_line(stdin);
+        if (!line) { printf("\n再见!\n"); break; }             /* Ctrl-D / EOF */
+        if (!line[0]) { free(line); continue; }                /* 空行忽略 */
 
-        /* 去掉行尾换行与回车 */
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-            line[--len] = 0;
-        if (len == 0) continue;                                /* 空行忽略 */
-
-        if (!strcmp(line, "/exit") || !strcmp(line, "/quit")) { printf("再见!\n"); break; }
+        if (!strcmp(line, "/exit") || !strcmp(line, "/quit")) {
+            free(line);
+            printf("再见!\n");
+            break;
+        }
         if (!strcmp(line, "/clear")) {
             st.pos = 0; /* 清空 KV 缓存即忘掉全部历史 */
             printf("[对话历史已清空]\n");
+            free(line);
             continue;
         }
 
         printf("助手> ");
         fflush(stdout);
         cli_chat_turn(&model, &st, &tok, &opt, sbuf, line);
+        free(line);
     }
-    free(line);
     return 0;
 }
 

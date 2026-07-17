@@ -11,7 +11,9 @@
 # 检测(同一产物在无 AVX2 的机器上也能跑)。
 #
 # Windows 下用 MinGW: gcc -O2 -o tinyqwen.exe tinyqwen.c
-#          或 MSVC:  cl /O2 tinyqwen.c
+#          或 MSVC:  cl /O2 /utf-8 tinyqwen.c
+#                    (/utf-8 必须加: 源码是 UTF-8 编码, MSVC 默认按系统
+#                     代码页解析, 中文注释与字符串会乱码甚至报错)
 # Windows 构建 DLL:   gcc -O2 -shared -DTINYQWEN_LIB -DTINYQWEN_SHARED \
 #                         -o tinyqwen.dll tinyqwen.c
 
