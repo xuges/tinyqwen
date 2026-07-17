@@ -10,6 +10,9 @@
 # 基础库。多线程用平台原生 API(POSIX pthread / Win32 线程), SIMD 用运行时
 # 检测(同一产物在无 AVX2 的机器上也能跑)。
 #
+# macOS: 直接 make 即可(gcc 通常是 clang 的别名; -lm/-pthread 都由 libSystem
+#        提供, 可正常链接)。make libs 生成的 libtinyqwen.so 在 macOS 上是有效
+#        的动态库, 惯例扩展名虽是 .dylib, 但 .so 一样能被链接和加载。
 # Windows 下用 MinGW: gcc -O2 -o tinyqwen.exe tinyqwen.c
 #          或 MSVC:  cl /O2 /utf-8 tinyqwen.c
 #                    (/utf-8 必须加: 源码是 UTF-8 编码, MSVC 默认按系统

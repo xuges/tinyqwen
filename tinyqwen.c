@@ -53,10 +53,19 @@
  * ===========================================================================
  */
 
-/* 启用 POSIX.1-2008 接口(clock_gettime / mmap / pthread 等)。
- * -std=c99 严格模式下 glibc 默认隐藏这些声明, 需显式声明特性宏。
- * Windows 下该宏无意义也无害(平台相关代码见下方 _WIN32 分支)。 */
+/* 启用各平台 libc 的 POSIX / 扩展接口(clock_gettime / mmap / sysconf 等)。
+ * -std=c99 会定义 __STRICT_ANSI__, 促使系统头文件进入"严格 ANSI"模式而
+ * 隐藏这些非 ANSI 声明, 需按平台声明相应特性宏把它们重新暴露出来:
+ *   - glibc(Linux): _POSIX_C_SOURCE 暴露 POSIX.1-2008 接口;
+ *   - Darwin(macOS): 必须用 _DARWIN_C_SOURCE 提到 __DARWIN_C_FULL 级 ——
+ *     仅定义 _POSIX_C_SOURCE 只到 POSIX 级, 仍会隐藏 _SC_NPROCESSORS_ONLN
+ *     等 Darwin 扩展, 导致 sysconf 处编译报错;
+ *   - Windows: 平台相关代码走 _WIN32 分支, 无需特性宏。 */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#elif !defined(_WIN32)
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1609,8 +1618,10 @@ TARGET_AVX2 static float dot_q6_k_avx2(const uint8_t *row, const float *x, int n
     return hsum8(acc);
 }
 
-#elif defined(__aarch64__) || defined(_M_ARM64)
-/* ===========================================================================
+#elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+/* __arm64__ 是 Apple(macOS/iOS)对 Apple Silicon 的传统架构宏; 现代 clang
+ * 也会定义 __aarch64__, 两个都判一下最稳妥。
+ * ===========================================================================
  * [4c] AArch64 NEON 加速内核(实验性)
  * ===========================================================================
  *
