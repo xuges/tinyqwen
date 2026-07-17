@@ -60,9 +60,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <math.h>
 #include <time.h>
-#include <setjmp.h>
 
 /* 公共库 API 声明(本文件同时是库的实现, TINYQWEN_BUILD 控制符号导出) */
 #define TINYQWEN_BUILD
@@ -89,24 +89,29 @@
  * ===========================================================================
  */
 
-/* 错误处理: 内部代码遇到不可继续的错误统一调用 die()。
- *   - 命令行模式: 打印错误并退出进程(最简单可靠);
- *   - 库 API 模式: 公共入口(tq_load 等)先设置 setjmp 恢复点并置
- *     g_err_catch, die() 改为记录错误信息后 longjmp 回入口, 入口向
- *     调用方返回 NULL/负值 —— 库永远不会杀死宿主进程。
- * 注意: 恢复点只在主调用线程生效; 工作线程执行的代码路径(点积内核)
- * 不含 die(所有张量类型已在加载期校验), 不存在跨线程跳转。 */
-static jmp_buf g_err_jmp;
-static int     g_err_catch = 0;
-static char    g_err_msg[256] = "尚无错误";
+/* ---- 错误处理约定 ----
+ * 可能失败的内部函数一律先调用 fail() 把错误描述写入 g_err_msg,
+ * 再通过返回值报告失败(int 返回 -1 / 指针返回 NULL / 浮点返回负值),
+ * 由调用方逐层向上传递:
+ *   - 作为库使用时, 错误码经公共 API(tq_load 返回 NULL 等)传给宿主,
+ *     描述用 tq_last_error() 读取 —— 库永远不会终止宿主进程;
+ *   - 作为命令行工具时, main 等入口检查返回值后调用 die()(定义在
+ *     命令行段 [9])打印错误并退出。
+ * bug() 只用于"理论不可达"的内部不变量破坏(例如加载期已校验过的
+ * 张量类型在运行期不被识别), 语义等同断言失败: 打印后 abort。 */
+static char g_err_msg[256] = "尚无错误";
 
-static void die(const char *msg) {
-    if (g_err_catch) {
-        snprintf(g_err_msg, sizeof(g_err_msg), "%s", msg);
-        longjmp(g_err_jmp, 1);
-    }
-    fprintf(stderr, "错误: %s\n", msg);
-    exit(1);
+static int fail(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_err_msg, sizeof(g_err_msg), fmt, ap);
+    va_end(ap);
+    return -1;
+}
+
+static void bug(const char *what) {
+    fprintf(stderr, "TinyQwen 内部错误(不变量被破坏): %s\n", what);
+    abort();
 }
 
 /* 半精度浮点(fp16, IEEE 754 binary16)转单精度。
@@ -182,9 +187,9 @@ static void cond_wait_(cond_t *c, mutex_t *m) { SleepConditionVariableCS(c, m, I
 static void cond_broadcast_(cond_t *c) { WakeAllConditionVariable(c); }
 
 static DWORD WINAPI win_thread_adapter(LPVOID p); /* 前向声明, 见下 */
-static void thread_create(thread_t *t, void *arg) {
+static int thread_create(thread_t *t, void *arg) {
     *t = CreateThread(NULL, 0, win_thread_adapter, arg, 0, NULL);
-    if (!*t) die("创建线程失败");
+    return *t ? 0 : fail("创建线程失败");
 }
 static void thread_join(thread_t t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
 
@@ -209,8 +214,8 @@ static void cond_wait_(cond_t *c, mutex_t *m) { pthread_cond_wait(c, m); }
 static void cond_broadcast_(cond_t *c) { pthread_cond_broadcast(c); }
 
 static void *posix_thread_adapter(void *p); /* 前向声明, 见下 */
-static void thread_create(thread_t *t, void *arg) {
-    if (pthread_create(t, NULL, posix_thread_adapter, arg)) die("创建线程失败");
+static int thread_create(thread_t *t, void *arg) {
+    return pthread_create(t, NULL, posix_thread_adapter, arg) ? fail("创建线程失败") : 0;
 }
 static void thread_join(thread_t t) { pthread_join(t, NULL); }
 
@@ -281,20 +286,33 @@ static DWORD WINAPI win_thread_adapter(LPVOID p) { pool_worker(*(int *)p); retur
 static void *posix_thread_adapter(void *p) { pool_worker(*(int *)p); return NULL; }
 #endif
 
-/* 创建线程池(n_threads 为总并行度, 传 1 则完全不建线程) */
-static void pool_init(int n_threads) {
+static void pool_shutdown(void); /* 前向声明: 部分创建失败时回收 */
+
+/* 创建线程池(n_threads 为总并行度, 传 1 则完全不建线程)。
+ * 失败返回 -1; 已创建的部分线程按实际数量记录, 可被 pool_shutdown 回收 */
+static int pool_init(int n_threads) {
     g_pool.n_threads = n_threads;
-    if (n_threads <= 1) return;
+    if (n_threads <= 1) return 0;
     mutex_init(&g_pool.mu);
     cond_init(&g_pool.cv_work);
     cond_init(&g_pool.cv_done);
     g_pool.workers    = malloc(sizeof(thread_t) * (n_threads - 1));
     g_pool.worker_ids = malloc(sizeof(int) * (n_threads - 1));
-    if (!g_pool.workers || !g_pool.worker_ids) die("内存不足");
+    if (!g_pool.workers || !g_pool.worker_ids) {
+        free(g_pool.workers); free(g_pool.worker_ids);
+        g_pool.workers = NULL; g_pool.worker_ids = NULL;
+        g_pool.n_threads = 1;
+        return fail("内存不足(创建线程池)");
+    }
     for (int i = 0; i < n_threads - 1; i++) {
         g_pool.worker_ids[i] = i + 1;              /* 工人编号 1..T-1 */
-        thread_create(&g_pool.workers[i], &g_pool.worker_ids[i]);
+        if (thread_create(&g_pool.workers[i], &g_pool.worker_ids[i]) < 0) {
+            g_pool.n_threads = i + 1;              /* 只保留已建成的线程 */
+            pool_shutdown();
+            return -1;
+        }
     }
+    return 0;
 }
 
 /* 通知全部工人退出并回收线程(进程结束前调用, 保证干净收尾) */
@@ -393,24 +411,26 @@ static const char *ggml_type_name(uint32_t t) {
 }
 #endif
 
-/* 每种量化类型的块大小: 一个块含多少个权重元素、占多少字节 */
-static void ggml_block_info(uint32_t t, uint64_t *elems, uint64_t *bytes) {
+/* 每种量化类型的块大小: 一个块含多少个权重元素、占多少字节。
+ * 不认识的类型返回 -1(加载期以此校验, 运行期不会再遇到未知类型) */
+static int ggml_block_info(uint32_t t, uint64_t *elems, uint64_t *bytes) {
     switch (t) {
-    case GGML_F32:  *elems = 1;   *bytes = 4;   return;
-    case GGML_F16:  *elems = 1;   *bytes = 2;   return;
-    case GGML_Q4_0: *elems = 32;  *bytes = 18;  return; /* fp16 d + 16B 半字节 */
-    case GGML_Q4_1: *elems = 32;  *bytes = 20;  return; /* fp16 d,m + 16B      */
-    case GGML_Q8_0: *elems = 32;  *bytes = 34;  return; /* fp16 d + 32B int8   */
-    case GGML_Q6_K: *elems = 256; *bytes = 210; return; /* 见 [4] 节反量化注释 */
-    default: die("不支持的张量量化类型");
+    case GGML_F32:  *elems = 1;   *bytes = 4;   return 0;
+    case GGML_F16:  *elems = 1;   *bytes = 2;   return 0;
+    case GGML_Q4_0: *elems = 32;  *bytes = 18;  return 0; /* fp16 d + 16B 半字节 */
+    case GGML_Q4_1: *elems = 32;  *bytes = 20;  return 0; /* fp16 d,m + 16B      */
+    case GGML_Q8_0: *elems = 32;  *bytes = 34;  return 0; /* fp16 d + 32B int8   */
+    case GGML_Q6_K: *elems = 256; *bytes = 210; return 0; /* 见 [4] 节反量化注释 */
+    default: return fail("不支持的张量量化类型(ggml 类型号 %u)", t);
     }
 }
 
-/* 一行(ne[0] 个元素)占多少字节 —— 量化块沿行方向排列, 行首总是块对齐的 */
+/* 一行(ne[0] 个元素)占多少字节 —— 量化块沿行方向排列, 行首总是块对齐的。
+ * 返回 0 表示类型不支持或行长不是块的整数倍(错误详情在 g_err_msg) */
 static uint64_t ggml_row_bytes(uint32_t type, uint64_t ne0) {
-    uint64_t elems, bytes;
-    ggml_block_info(type, &elems, &bytes);
-    if (ne0 % elems) die("张量行长不是量化块的整数倍");
+    uint64_t elems = 0, bytes = 0;
+    if (ggml_block_info(type, &elems, &bytes) < 0) return 0;
+    if (ne0 % elems) { fail("张量行长不是量化块的整数倍"); return 0; }
     return ne0 / elems * bytes;
 }
 
@@ -446,11 +466,20 @@ typedef struct {
     GTensor       *tensors;
 } Gguf;
 
-/* 带边界检查的顺序读取游标 —— 防止损坏的文件让我们读越界 */
-typedef struct { const uint8_t *p, *end; } Cursor;
+/* 带边界检查的顺序读取游标 —— 防止损坏的文件让我们读越界。
+ * 采用"粘性错误"设计(类似 stdio 的 ferror): 越界时置 err 标志并返回
+ * 指向零缓冲的安全指针, 后续读取全部得到 0 但不会访问非法内存,
+ * 解析结束后统一检查一次 err 即可, 避免每次读取都写错误分支。 */
+typedef struct { const uint8_t *p, *end; int err; } Cursor;
+
+static const uint8_t g_cur_zeros[16]; /* 越界读取的替身(标量最长 8 字节) */
 
 static const uint8_t *cur_take(Cursor *c, uint64_t n) {
-    if ((uint64_t)(c->end - c->p) < n) die("GGUF 文件被截断或已损坏");
+    if ((uint64_t)(c->end - c->p) < n) {
+        c->err = 1;
+        c->p = c->end;        /* 快进到末尾, 让解析尽快自然结束 */
+        return g_cur_zeros;   /* 只被 memcpy <= 8 字节, 安全     */
+    }
     const uint8_t *ret = c->p;
     c->p += n;
     return ret;
@@ -458,20 +487,30 @@ static const uint8_t *cur_take(Cursor *c, uint64_t n) {
 static uint32_t cur_u32(Cursor *c) { uint32_t v; memcpy(&v, cur_take(c, 4), 4); return v; }
 static uint64_t cur_u64(Cursor *c) { uint64_t v; memcpy(&v, cur_take(c, 8), 8); return v; }
 
-/* 读取 GGUF 字符串(长度前缀), 返回指向 mmap 的指针(不含 \0), 长度写入 *len */
+/* 读取 GGUF 字符串(长度前缀), 返回指向 mmap 的指针(不含 \0), 长度写入 *len。
+ * 长度越界时置错误标志并返回空串, 调用方拿到 len=0 不会越界拷贝。 */
 static const char *cur_str(Cursor *c, uint64_t *len) {
-    *len = cur_u64(c);
-    return (const char *)cur_take(c, *len);
+    uint64_t l = cur_u64(c);
+    if ((uint64_t)(c->end - c->p) < l) {
+        c->err = 1;
+        c->p = c->end;
+        *len = 0;
+        return (const char *)g_cur_zeros;
+    }
+    *len = l;
+    const char *ret = (const char *)c->p;
+    c->p += l;
+    return ret;
 }
 
-/* 标量值类型的字节宽度 */
+/* 标量值类型的字节宽度(未知类型返回 0, 由调用方置游标错误标志) */
 static uint64_t gguf_scalar_size(uint32_t t) {
     switch (t) {
     case GGUF_U8: case GGUF_I8: case GGUF_BOOL:   return 1;
     case GGUF_U16: case GGUF_I16:                 return 2;
     case GGUF_U32: case GGUF_I32: case GGUF_F32:  return 4;
     case GGUF_U64: case GGUF_I64: case GGUF_F64:  return 8;
-    default: die("未知的 GGUF 标量类型"); return 0;
+    default: return 0;
     }
 }
 
@@ -487,12 +526,19 @@ static void gguf_read_value(Cursor *c, uint32_t type, GgufKV *kv) {
         kv->arr_n    = cur_u64(c);
         kv->arr_data = c->p;
         if (kv->arr_type == GGUF_STRING) {
-            /* 字符串数组: 逐个跳过(记录首地址, 用到时再重新遍历) */
-            for (uint64_t i = 0; i < kv->arr_n; i++) { uint64_t l; cur_str(c, &l); }
+            /* 字符串数组: 逐个跳过(记录首地址, 用到时再重新遍历)。
+             * 出错(文件截断)立即停, 防止 arr_n 是垃圾值导致长循环 */
+            for (uint64_t i = 0; i < kv->arr_n && !c->err; i++) {
+                uint64_t l;
+                cur_str(c, &l);
+            }
         } else if (kv->arr_type == GGUF_ARRAY) {
-            die("不支持嵌套数组元数据");
+            c->err = 1;   /* 嵌套数组: 规范允许但模型文件不会出现 */
         } else {
-            cur_take(c, kv->arr_n * gguf_scalar_size(kv->arr_type));
+            uint64_t esz = gguf_scalar_size(kv->arr_type);
+            if (!esz) { c->err = 1; break; }
+            if (kv->arr_n > (uint64_t)(c->end - c->p) / esz) { c->err = 1; break; }
+            cur_take(c, kv->arr_n * esz);
         }
         break;
     }
@@ -502,62 +548,84 @@ static void gguf_read_value(Cursor *c, uint32_t type, GgufKV *kv) {
     case GGUF_I16: { int16_t v; memcpy(&v, cur_take(c, 2), 2); kv->v.i = v; break; }
     case GGUF_I32: { int32_t v; memcpy(&v, cur_take(c, 4), 4); kv->v.i = v; break; }
     case GGUF_I64: { int64_t v; memcpy(&v, cur_take(c, 8), 8); kv->v.i = v; break; }
-    default: { /* 无符号整数与 bool */
+    default: { /* 无符号整数与 bool(未知值类型视为文件损坏) */
+        uint64_t sz = gguf_scalar_size(type);
+        if (!sz) { c->err = 1; break; }
         uint64_t v = 0;
-        memcpy(&v, cur_take(c, gguf_scalar_size(type)), gguf_scalar_size(type));
+        memcpy(&v, cur_take(c, sz), sz);
         kv->v.u = v;
         break;
     }
     }
 }
 
-/* 打开并完整解析一个 GGUF 文件的元数据和张量目录。
+static void gguf_close(Gguf *g); /* 前向声明: 失败路径的清理用 */
+
+/* 打开并完整解析一个 GGUF 文件的元数据和张量目录, 结果填入 *out。
  * POSIX 平台用 mmap 零拷贝映射(内核按需换页, "加载"瞬间完成);
- * Windows 平台退化为一次性 fread 读入堆内存(实现最简, 行为等价)。 */
-static Gguf gguf_open(const char *path) {
+ * Windows 平台退化为一次性 fread 读入堆内存(实现最简, 行为等价)。
+ * 返回 0 成功, -1 失败(已释放全部中间资源, 错误详情在 g_err_msg)。 */
+static int gguf_open(Gguf *out, const char *path) {
     Gguf g = {0};
+    memset(out, 0, sizeof(*out));
 
 #ifdef _WIN32
     FILE *f = fopen(path, "rb");
-    if (!f) die("无法打开模型文件");
+    if (!f) return fail("无法打开模型文件: %s", path);
     fseek(f, 0, SEEK_END);
     long long sz = _ftelli64(f);
     fseek(f, 0, SEEK_SET);
-    if (sz <= 0) die("无法获取模型文件大小");
+    if (sz <= 0) { fclose(f); return fail("无法获取模型文件大小"); }
     g.size = (size_t)sz;
     uint8_t *buf = malloc(g.size);
-    if (!buf) die("内存不足(读入模型文件)");
-    if (fread(buf, 1, g.size, f) != g.size) die("读取模型文件失败");
+    if (!buf) { fclose(f); return fail("内存不足(读入模型文件)"); }
+    if (fread(buf, 1, g.size, f) != g.size) {
+        fclose(f);
+        free(buf);
+        return fail("读取模型文件失败");
+    }
     fclose(f);
     g.base = buf;
 #else
     int fd = open(path, O_RDONLY);
-    if (fd < 0) die("无法打开模型文件");
+    if (fd < 0) return fail("无法打开模型文件: %s", path);
     struct stat st;
-    if (fstat(fd, &st) < 0) die("无法获取模型文件大小");
+    if (fstat(fd, &st) < 0) { close(fd); return fail("无法获取模型文件大小"); }
     g.size = (size_t)st.st_size;
 
     /* MAP_PRIVATE 只读映射: 权重永远不复制进堆内存, 由内核按需加载页 */
     g.base = (const uint8_t *)mmap(NULL, g.size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (g.base == MAP_FAILED) die("mmap 模型文件失败");
-    close(fd); /* mmap 建立后文件描述符即可关闭 */
+    close(fd); /* mmap 建立(或失败)后文件描述符都不再需要 */
+    if (g.base == MAP_FAILED) {
+        g.base = NULL;
+        return fail("mmap 模型文件失败");
+    }
 #endif
 
-    Cursor c = { g.base, g.base + g.size };
+    Cursor c = { g.base, g.base + g.size, 0 };
 
     /* ---- 头部 ---- */
-    if (memcmp(cur_take(&c, 4), "GGUF", 4)) die("不是 GGUF 文件(魔数不符)");
+    if (memcmp(cur_take(&c, 4), "GGUF", 4)) {
+        fail("不是 GGUF 文件(魔数不符)");
+        goto bad;
+    }
     uint32_t version = cur_u32(&c);
-    if (version < 2 || version > 3) die("只支持 GGUF v2/v3");
+    if (version < 2 || version > 3) {
+        fail("只支持 GGUF v2/v3(文件版本 %u)", version);
+        goto bad;
+    }
     g.n_tensors = cur_u64(&c);
     g.n_kv      = cur_u64(&c);
-    if (g.n_tensors > 100000 || g.n_kv > 100000) die("GGUF 头部数值异常");
+    if (g.n_tensors > 100000 || g.n_kv > 100000) {
+        fail("GGUF 头部数值异常");
+        goto bad;
+    }
 
     /* ---- 元数据键值对 ---- */
-    g.kv = calloc(g.n_kv, sizeof(GgufKV));
-    if (!g.kv) die("内存不足");
+    g.kv = calloc(g.n_kv ? g.n_kv : 1, sizeof(GgufKV));
+    if (!g.kv) { fail("内存不足"); goto bad; }
     uint64_t alignment = 32; /* 数据区对齐, 可被 general.alignment 覆盖 */
-    for (uint64_t i = 0; i < g.n_kv; i++) {
+    for (uint64_t i = 0; i < g.n_kv && !c.err; i++) {
         uint64_t klen;
         const char *k = cur_str(&c, &klen);
         GgufKV *kv = &g.kv[i];
@@ -568,11 +636,12 @@ static Gguf gguf_open(const char *path) {
         if (!strcmp(kv->key, "general.alignment") && kv->type == GGUF_U32)
             alignment = kv->v.u;
     }
+    if (alignment == 0) alignment = 32;
 
     /* ---- 张量目录 ---- */
-    g.tensors = calloc(g.n_tensors, sizeof(GTensor));
-    if (!g.tensors) die("内存不足");
-    for (uint64_t i = 0; i < g.n_tensors; i++) {
+    g.tensors = calloc(g.n_tensors ? g.n_tensors : 1, sizeof(GTensor));
+    if (!g.tensors) { fail("内存不足"); goto bad; }
+    for (uint64_t i = 0; i < g.n_tensors && !c.err; i++) {
         GTensor *t = &g.tensors[i];
         uint64_t nlen;
         const char *n = cur_str(&c, &nlen);
@@ -580,12 +649,18 @@ static Gguf gguf_open(const char *path) {
         memcpy(t->name, n, nlen);
         t->name[nlen] = 0;
         t->n_dims = cur_u32(&c);
-        if (t->n_dims > 4) die("张量维度数超过 4");
+        if (t->n_dims > 4) { fail("张量维度数超过 4"); goto bad; }
         t->ne[0] = t->ne[1] = t->ne[2] = t->ne[3] = 1;
         for (uint32_t d = 0; d < t->n_dims; d++) t->ne[d] = cur_u64(&c);
         t->type = cur_u32(&c);
         uint64_t off = cur_u64(&c);
         t->data = (const void *)(uintptr_t)off; /* 暂存偏移, 下面再换算成指针 */
+    }
+
+    /* 粘性错误统一检查: 任何一步读越界都会走到这里 */
+    if (c.err) {
+        fail("GGUF 文件被截断或已损坏");
+        goto bad;
     }
 
     /* ---- 张量数据区: 从对齐后的位置开始 ---- */
@@ -594,13 +669,22 @@ static Gguf gguf_open(const char *path) {
 
     for (uint64_t i = 0; i < g.n_tensors; i++) {
         GTensor *t = &g.tensors[i];
-        uint64_t off    = (uint64_t)(uintptr_t)t->data;
-        uint64_t nrows  = t->ne[1] * t->ne[2] * t->ne[3];
-        uint64_t nbytes = ggml_row_bytes(t->type, t->ne[0]) * nrows;
-        if (data_start + off + nbytes > g.size) die("张量数据越过文件末尾");
+        uint64_t off      = (uint64_t)(uintptr_t)t->data;
+        uint64_t nrows    = t->ne[1] * t->ne[2] * t->ne[3];
+        uint64_t row_size = ggml_row_bytes(t->type, t->ne[0]);
+        if (!row_size) goto bad; /* 不支持的量化类型, 错误信息已设置 */
+        if (data_start + off + row_size * nrows > g.size) {
+            fail("张量 %s 的数据越过文件末尾", t->name);
+            goto bad;
+        }
         t->data = g.base + data_start + off;
     }
-    return g;
+    *out = g;
+    return 0;
+
+bad:
+    gguf_close(&g);
+    return -1;
 }
 
 /* 释放 gguf_open 占用的全部资源(映射/缓冲与目录表) */
@@ -623,27 +707,28 @@ static const GgufKV *gguf_kv(const Gguf *g, const char *key) {
     return NULL;
 }
 
-/* 取无符号整数元数据(强制存在) */
-static uint64_t gguf_kv_uint(const Gguf *g, const char *key) {
+/* 取必需的无符号整数元数据。缺失时把 *err 置 -1 并记录错误信息;
+ * *err 是"累积"语义, 调用方可连续取多个键后只检查一次 */
+static uint64_t gguf_kv_uint(const Gguf *g, const char *key, int *err) {
     const GgufKV *kv = gguf_kv(g, key);
-    if (!kv) { fprintf(stderr, "缺少元数据: %s\n", key); exit(1); }
+    if (!kv) { *err = fail("缺少元数据: %s", key); return 0; }
     if (kv->type == GGUF_I32 || kv->type == GGUF_I64) return (uint64_t)kv->v.i;
     return kv->v.u;
 }
 
-/* 取浮点元数据(强制存在) */
-static float gguf_kv_float(const Gguf *g, const char *key) {
+/* 取必需的浮点元数据(错误处理同上) */
+static float gguf_kv_float(const Gguf *g, const char *key, int *err) {
     const GgufKV *kv = gguf_kv(g, key);
-    if (!kv) { fprintf(stderr, "缺少元数据: %s\n", key); exit(1); }
+    if (!kv) { *err = fail("缺少元数据: %s", key); return 0.0f; }
     return (float)kv->v.f;
 }
 
-/* 按名字查找张量(强制存在) */
+/* 按名字查找必需的张量, 缺失返回 NULL 并记录错误信息 */
 static const GTensor *gguf_tensor(const Gguf *g, const char *name) {
     for (uint64_t i = 0; i < g->n_tensors; i++)
         if (!strcmp(g->tensors[i].name, name)) return &g->tensors[i];
-    fprintf(stderr, "缺少张量: %s\n", name);
-    exit(1);
+    fail("缺少张量: %s", name);
+    return NULL;
 }
 
 #ifndef TINYQWEN_LIB
@@ -760,11 +845,16 @@ static uint64_t str_hash(const char *s) {
     return h;
 }
 
-static void strmap_init(StrMap *m, uint32_t cap_pow2) {
+static int strmap_init(StrMap *m, uint32_t cap_pow2) {
     m->keys = calloc(cap_pow2, sizeof(char *));
     m->vals = malloc(cap_pow2 * sizeof(int32_t));
-    if (!m->keys || !m->vals) die("内存不足");
     m->mask = cap_pow2 - 1;
+    if (!m->keys || !m->vals) {
+        free(m->keys); free(m->vals);
+        m->keys = NULL; m->vals = NULL;
+        return fail("内存不足(分词哈希表)");
+    }
+    return 0;
 }
 
 static void strmap_put(StrMap *m, const char *key, int32_t val) {
@@ -807,55 +897,59 @@ typedef struct {
 #define TOKEN_TYPE_NORMAL  1
 #define TOKEN_TYPE_CONTROL 3
 
-/* 从 GGUF 元数据构建分词器: 拷贝词表字符串、建两张哈希表 */
-static Tokenizer tok_init(const Gguf *g) {
-    Tokenizer t = {0};
+static void tok_free(Tokenizer *t); /* 前向声明: 失败路径的清理用 */
+
+/* 从 GGUF 元数据构建分词器: 拷贝词表字符串、建两张哈希表。
+ * 结果填入 *t; 返回 0 成功, -1 失败(已释放全部中间资源)。 */
+static int tok_init(Tokenizer *t, const Gguf *g) {
+    memset(t, 0, sizeof(*t));
     bytemap_init();
 
     const GgufKV *tokens = gguf_kv(g, "tokenizer.ggml.tokens");
     const GgufKV *types  = gguf_kv(g, "tokenizer.ggml.token_type");
     const GgufKV *merges = gguf_kv(g, "tokenizer.ggml.merges");
-    if (!tokens || tokens->arr_type != GGUF_STRING) die("模型缺少词表");
-    if (!merges || merges->arr_type != GGUF_STRING) die("模型缺少 BPE 合并规则");
+    if (!tokens || tokens->arr_type != GGUF_STRING)
+        return fail("模型缺少词表(tokenizer.ggml.tokens)");
+    if (!merges || merges->arr_type != GGUF_STRING)
+        return fail("模型缺少 BPE 合并规则(tokenizer.ggml.merges)");
 
-    t.n_vocab = (int)tokens->arr_n;
+    t->n_vocab = (int)tokens->arr_n;
 
     /* -- 词表: GGUF 里是长度前缀字符串, 拷贝为以 \0 结尾的 C 字符串 --
      * 全部字符串放进一个连续 arena, 只做一次大分配。 */
     uint64_t total = 0;
     {   /* 第一遍: 统计总字节数 */
-        Cursor c = { tokens->arr_data, g->base + g->size };
-        for (int i = 0; i < t.n_vocab; i++) { uint64_t l; cur_str(&c, &l); total += l + 1; }
+        Cursor c = { tokens->arr_data, g->base + g->size, 0 };
+        for (int i = 0; i < t->n_vocab; i++) { uint64_t l; cur_str(&c, &l); total += l + 1; }
     }
-    char *arena = malloc(total);
-    t.vocab = malloc(sizeof(char *) * t.n_vocab);
-    if (!arena || !t.vocab) die("内存不足");
-    t.arena_vocab = arena;
+    t->arena_vocab = malloc(total);
+    t->vocab = malloc(sizeof(char *) * t->n_vocab);
+    if (!t->arena_vocab || !t->vocab) goto oom;
     {   /* 第二遍: 拷贝 */
-        Cursor c = { tokens->arr_data, g->base + g->size };
-        char *w = arena;
-        for (int i = 0; i < t.n_vocab; i++) {
+        Cursor c = { tokens->arr_data, g->base + g->size, 0 };
+        char *w = t->arena_vocab;
+        for (int i = 0; i < t->n_vocab; i++) {
             uint64_t l;
             const char *s = cur_str(&c, &l);
             memcpy(w, s, l);
             w[l] = 0;
-            t.vocab[i] = w;
+            t->vocab[i] = w;
             w += l + 1;
         }
     }
 
     /* -- token 类型表 (控制 token 解码时跳过显示) -- */
-    t.token_type = malloc(sizeof(int32_t) * t.n_vocab);
-    if (!t.token_type) die("内存不足");
-    if (types && types->arr_type == GGUF_I32 && (int)types->arr_n == t.n_vocab) {
-        memcpy(t.token_type, types->arr_data, sizeof(int32_t) * t.n_vocab);
+    t->token_type = malloc(sizeof(int32_t) * t->n_vocab);
+    if (!t->token_type) goto oom;
+    if (types && types->arr_type == GGUF_I32 && (int)types->arr_n == t->n_vocab) {
+        memcpy(t->token_type, types->arr_data, sizeof(int32_t) * t->n_vocab);
     } else {
-        for (int i = 0; i < t.n_vocab; i++) t.token_type[i] = TOKEN_TYPE_NORMAL;
+        for (int i = 0; i < t->n_vocab; i++) t->token_type[i] = TOKEN_TYPE_NORMAL;
     }
 
     /* -- 词表哈希: 字符串 -> id -- */
-    strmap_init(&t.vocab_map, 1u << 19); /* 524288 槽 > 2*151936 的一半, 足够稀疏 */
-    for (int i = 0; i < t.n_vocab; i++) strmap_put(&t.vocab_map, t.vocab[i], i);
+    if (strmap_init(&t->vocab_map, 1u << 19) < 0) goto bad; /* 52 万槽足够稀疏 */
+    for (int i = 0; i < t->n_vocab; i++) strmap_put(&t->vocab_map, t->vocab[i], i);
 
     /* -- 合并规则哈希: "左 右" -> 优先级 --
      * GGUF 中每条规则形如 "Ġ Ġ" (左右两半用空格分隔; token 字符串本身
@@ -863,36 +957,43 @@ static Tokenizer tok_init(const Gguf *g) {
     {
         int n_merges = (int)merges->arr_n;
         uint64_t mtotal = 0;
-        Cursor c = { merges->arr_data, g->base + g->size };
+        Cursor c = { merges->arr_data, g->base + g->size, 0 };
         for (int i = 0; i < n_merges; i++) { uint64_t l; cur_str(&c, &l); mtotal += l + 1; }
-        char *marena = malloc(mtotal);
-        if (!marena) die("内存不足");
-        t.arena_merges = marena;
-        strmap_init(&t.merge_map, 1u << 19);
+        t->arena_merges = malloc(mtotal);
+        if (!t->arena_merges) goto oom;
+        if (strmap_init(&t->merge_map, 1u << 19) < 0) goto bad;
         c.p = merges->arr_data;
-        char *w = marena;
+        char *w = t->arena_merges;
         for (int i = 0; i < n_merges; i++) {
             uint64_t l;
             const char *s = cur_str(&c, &l);
             memcpy(w, s, l);
             w[l] = 0;
-            strmap_put(&t.merge_map, w, i); /* 越靠前的规则优先级越高(数值越小) */
+            strmap_put(&t->merge_map, w, i); /* 越靠前的规则优先级越高(数值越小) */
             w += l + 1;
         }
     }
 
     /* -- 查出常用特殊 token 的 id -- */
-    t.im_start_id  = strmap_get(&t.vocab_map, "<|im_start|>");
-    t.im_end_id    = strmap_get(&t.vocab_map, "<|im_end|>");
-    t.think_id     = strmap_get(&t.vocab_map, "<think>");
-    t.think_end_id = strmap_get(&t.vocab_map, "</think>");
-    t.nl_id        = strmap_get(&t.vocab_map, "\xC4\x8A"); /* 'Ċ' = 换行的映射 */
-    if (t.im_start_id < 0 || t.im_end_id < 0 || t.nl_id < 0)
-        die("词表中找不到 ChatML 特殊 token");
+    t->im_start_id  = strmap_get(&t->vocab_map, "<|im_start|>");
+    t->im_end_id    = strmap_get(&t->vocab_map, "<|im_end|>");
+    t->think_id     = strmap_get(&t->vocab_map, "<think>");
+    t->think_end_id = strmap_get(&t->vocab_map, "</think>");
+    t->nl_id        = strmap_get(&t->vocab_map, "\xC4\x8A"); /* 'Ċ' = 换行的映射 */
+    if (t->im_start_id < 0 || t->im_end_id < 0 || t->nl_id < 0) {
+        fail("词表中找不到 ChatML 特殊 token(不是 Qwen 系列模型?)");
+        goto bad;
+    }
 
     const GgufKV *eos = gguf_kv(g, "tokenizer.ggml.eos_token_id");
-    t.eos_id = eos ? (int)eos->v.u : t.im_end_id;
-    return t;
+    t->eos_id = eos ? (int)eos->v.u : t->im_end_id;
+    return 0;
+
+oom:
+    fail("内存不足(构建分词器)");
+bad:
+    tok_free(t);
+    return -1;
 }
 
 /* 释放分词器全部内存 */
@@ -908,7 +1009,7 @@ static void tok_free(Tokenizer *t) {
     memset(t, 0, sizeof(*t));
 }
 
-/* 把 UTF-8 文本编码成 token id 序列, 返回 token 个数。
+/* 把 UTF-8 文本编码成 token id 序列, 返回 token 个数(失败返回 -1)。
  *
  * 算法: 经典的“贪心逐对合并” ——
  *   1. 每个输入字节先变成一个单字符符号(该字节映射码点的 UTF-8 串);
@@ -926,7 +1027,11 @@ static int tok_encode(const Tokenizer *t, const char *text, int *out, int max_ou
      * 每次合并生成的串是词表中的合法 token(长度有限), 上界取充裕值。 */
     size_t arena_cap = n_bytes * 3 + 8 + (size_t)n_bytes * 96;
     char *arena = malloc(arena_cap), *aw = arena;
-    if (!syms || !arena) die("内存不足");
+    if (!syms || !arena) {
+        free(syms);
+        free(arena);
+        return fail("内存不足(分词缓冲)");
+    }
 
     /* 1. 字节 -> 初始符号 */
     int n = 0;
@@ -956,7 +1061,11 @@ static int tok_encode(const Tokenizer *t, const char *text, int *out, int max_ou
 
         /* 合并 syms[best_i] 和 syms[best_i+1] -> arena 里的新串 */
         int newlen = syms[best_i].len + syms[best_i + 1].len;
-        if ((size_t)(aw - arena) + newlen + 1 > arena_cap) die("分词缓冲区溢出(输入过长)");
+        if ((size_t)(aw - arena) + newlen + 1 > arena_cap) {
+            free(syms);
+            free(arena);
+            return fail("分词缓冲区溢出(输入过长)");
+        }
         memcpy(aw, syms[best_i].s, syms[best_i].len);
         memcpy(aw + syms[best_i].len, syms[best_i + 1].s, syms[best_i + 1].len);
         aw[newlen] = 0;
@@ -983,7 +1092,11 @@ static int tok_encode(const Tokenizer *t, const char *text, int *out, int max_ou
             }
             continue;
         }
-        if (n_out >= max_out) die("输入过长(token 超出缓冲)");
+        if (n_out >= max_out) {
+            free(syms);
+            free(arena);
+            return fail("输入过长(token 数超出缓冲)");
+        }
         out[n_out++] = id;
     }
     free(syms);
@@ -1064,46 +1177,58 @@ static const GTensor *gguf_tensor_opt(const Gguf *g, const char *name) {
     return NULL;
 }
 
-static Model model_load(const Gguf *g, int ctx_limit) {
+static void model_free(Model *m); /* 前向声明: 失败路径的清理用 */
+
+/* 加载模型: 读取超参数、定位全部权重张量, 结果填入 *out。
+ * 返回 0 成功, -1 失败(已释放中间资源, 错误详情在 g_err_msg)。 */
+static int model_load(Model *out, const Gguf *g, int ctx_limit) {
     Model m = {0};
     Config *c = &m.cfg;
+    memset(out, 0, sizeof(*out));
 
     /* ---- 架构检查 ----
      * 同一套代码支持 qwen3 架构的全部稠密规格(0.6B/1.7B/4B/8B/14B/32B):
      * 层数、维度、头数等一切结构差异都由下面的元数据驱动。 */
     const GgufKV *arch = gguf_kv(g, "general.architecture");
     if (!arch || arch->str_len != 5 || memcmp(arch->str, "qwen3", 5))
-        die("不支持的模型架构(目前只支持 qwen3 系列稠密模型)");
+        return fail("不支持的模型架构(目前只支持 qwen3 系列稠密模型)");
 
-    /* ---- 超参数 ---- */
-    c->dim        = (int)gguf_kv_uint(g, "qwen3.embedding_length");
-    c->n_layers   = (int)gguf_kv_uint(g, "qwen3.block_count");
-    c->n_heads    = (int)gguf_kv_uint(g, "qwen3.attention.head_count");
-    c->n_kv_heads = (int)gguf_kv_uint(g, "qwen3.attention.head_count_kv");
-    c->head_dim   = (int)gguf_kv_uint(g, "qwen3.attention.key_length");
-    if ((int)gguf_kv_uint(g, "qwen3.attention.value_length") != c->head_dim)
-        die("暂不支持 K/V 头维度不一致的模型");
-    c->ffn_dim    = (int)gguf_kv_uint(g, "qwen3.feed_forward_length");
-    c->rope_base  = gguf_kv_float(g, "qwen3.rope.freq_base");
-    c->rms_eps    = gguf_kv_float(g, "qwen3.attention.layer_norm_rms_epsilon");
-    int model_ctx = (int)gguf_kv_uint(g, "qwen3.context_length");
-    c->ctx_len    = ctx_limit < model_ctx ? ctx_limit : model_ctx;
+    /* ---- 超参数(err 为累积错误标志, 取完统一检查) ---- */
+    int err = 0;
+    c->dim        = (int)gguf_kv_uint(g, "qwen3.embedding_length", &err);
+    c->n_layers   = (int)gguf_kv_uint(g, "qwen3.block_count", &err);
+    c->n_heads    = (int)gguf_kv_uint(g, "qwen3.attention.head_count", &err);
+    c->n_kv_heads = (int)gguf_kv_uint(g, "qwen3.attention.head_count_kv", &err);
+    c->head_dim   = (int)gguf_kv_uint(g, "qwen3.attention.key_length", &err);
+    c->ffn_dim    = (int)gguf_kv_uint(g, "qwen3.feed_forward_length", &err);
+    c->rope_base  = gguf_kv_float(g, "qwen3.rope.freq_base", &err);
+    c->rms_eps    = gguf_kv_float(g, "qwen3.attention.layer_norm_rms_epsilon", &err);
+    int model_ctx = (int)gguf_kv_uint(g, "qwen3.context_length", &err);
+    if (err) return -1;
+    if ((int)gguf_kv_uint(g, "qwen3.attention.value_length", &err) != c->head_dim)
+        return fail("暂不支持 K/V 头维度不一致的模型");
+    if (c->dim <= 0 || c->n_layers <= 0 || c->n_heads <= 0 ||
+        c->n_kv_heads <= 0 || c->head_dim <= 0 || c->ffn_dim <= 0 ||
+        c->n_heads % c->n_kv_heads != 0)
+        return fail("模型超参数取值异常");
+    c->ctx_len = ctx_limit < model_ctx ? ctx_limit : model_ctx;
 
     /* ---- 全局张量 ---- */
     m.token_embd  = gguf_tensor(g, "token_embd.weight");
     m.output_norm = gguf_tensor(g, "output_norm.weight");
-    m.output      = gguf_tensor_opt(g, "output.weight"); /* 0.6B: 共享嵌入 */
-    c->n_vocab    = (int)m.token_embd->ne[1];
+    m.output      = gguf_tensor_opt(g, "output.weight"); /* 小模型: 共享嵌入 */
+    if (!m.token_embd || !m.output_norm) return -1;
+    c->n_vocab = (int)m.token_embd->ne[1];
 
     /* ---- 每层张量: 名字形如 blk.<层号>.<用途>.weight ---- */
     m.layers = calloc(c->n_layers, sizeof(Layer));
-    if (!m.layers) die("内存不足");
+    if (!m.layers) return fail("内存不足");
     char nm[64];
     for (int l = 0; l < c->n_layers; l++) {
         Layer *L = &m.layers[l];
 #define GET(field, suffix) \
         snprintf(nm, sizeof(nm), "blk.%d." suffix ".weight", l); \
-        L->field = gguf_tensor(g, nm)
+        if (!(L->field = gguf_tensor(g, nm))) goto bad
         GET(attn_norm, "attn_norm");
         GET(attn_q,    "attn_q");
         GET(attn_k,    "attn_k");
@@ -1123,17 +1248,24 @@ static Model model_load(const Gguf *g, int ctx_limit) {
         (int)m.layers[0].attn_q->ne[1] != c->n_heads * c->head_dim ||
         (int)m.layers[0].attn_k->ne[1] != c->n_kv_heads * c->head_dim ||
         (int)m.layers[0].ffn_gate->ne[1] != c->ffn_dim ||
-        (int)m.token_embd->ne[0] != c->dim)
-        die("张量维度与超参数不一致");
+        (int)m.token_embd->ne[0] != c->dim) {
+        fail("张量维度与超参数不一致");
+        goto bad;
+    }
 
     /* ---- RoPE 频率表: freq[i] = base^(-2i/head_dim) ---- */
     int half = c->head_dim / 2;
     m.rope_freq = malloc(sizeof(float) * half);
-    if (!m.rope_freq) die("内存不足");
+    if (!m.rope_freq) { fail("内存不足"); goto bad; }
     for (int i = 0; i < half; i++)
         m.rope_freq[i] = powf(c->rope_base, -2.0f * i / c->head_dim);
 
-    return m;
+    *out = m;
+    return 0;
+
+bad:
+    model_free(&m);
+    return -1;
 }
 
 /* 释放模型的目录性内存(权重本体在 mmap 中, 由 gguf_close 释放) */
@@ -1531,7 +1663,7 @@ static void matvec_task(int r0, int r1, const void *pc) {
             v = s;
             break;
         }
-        default: die("matvec: 不支持的张量类型"); v = 0;
+        default: bug("matvec 遇到未知张量类型(加载期校验遗漏)"); v = 0;
         }
         c->out[r] = v;
     }
@@ -1591,7 +1723,7 @@ static void dequant_row(const GTensor *t, int row, float *out) {
             for (int i = 0; i < 32; i++) out[b * 32 + i] = d * (float)qs[i];
         }
         break;
-    default: die("dequant_row: 不支持的张量类型");
+    default: bug("dequant_row 遇到未知张量类型(加载期校验遗漏)");
     }
 }
 
@@ -1638,32 +1770,37 @@ typedef struct {
     int    pos;    /* 已写入缓存的 token 数(= 下一个 token 的位置)    */
 } RunState;
 
-static RunState state_alloc(const Config *c) {
-    RunState s = {0};
+static void state_free(RunState *s); /* 前向声明: 失败路径的清理用 */
+
+/* 分配全部激活缓冲与 KV 缓存, 结果填入 *s。返回 0 成功, -1 失败。 */
+static int state_alloc(RunState *s, const Config *c) {
+    memset(s, 0, sizeof(*s));
     int qdim  = c->n_heads * c->head_dim;
     int kvdim = c->n_kv_heads * c->head_dim;
     int xbdim = qdim > c->dim ? qdim : c->dim;
     size_t cache = (size_t)c->n_layers * c->ctx_len * kvdim;
 
-    s.x      = malloc(sizeof(float) * c->dim);
-    s.xb     = malloc(sizeof(float) * xbdim);
-    s.xb2    = malloc(sizeof(float) * c->dim);
-    s.q      = malloc(sizeof(float) * qdim);
-    s.k      = malloc(sizeof(float) * kvdim);
-    s.v      = malloc(sizeof(float) * kvdim);
-    s.att    = malloc(sizeof(float) * c->n_heads * c->ctx_len);
-    s.hb     = malloc(sizeof(float) * c->ffn_dim);
-    s.hb2    = malloc(sizeof(float) * c->ffn_dim);
-    s.logits = malloc(sizeof(float) * c->n_vocab);
-    s.cos_t  = malloc(sizeof(float) * (c->head_dim / 2));
-    s.sin_t  = malloc(sizeof(float) * (c->head_dim / 2));
-    s.k_cache = malloc(sizeof(float) * cache);
-    s.v_cache = malloc(sizeof(float) * cache);
-    if (!s.x || !s.xb || !s.xb2 || !s.q || !s.k || !s.v || !s.att ||
-        !s.hb || !s.hb2 || !s.logits || !s.cos_t || !s.sin_t ||
-        !s.k_cache || !s.v_cache)
-        die("内存不足(KV 缓存过大? 可用 -c 减小上下文长度)");
-    return s;
+    s->x      = malloc(sizeof(float) * c->dim);
+    s->xb     = malloc(sizeof(float) * xbdim);
+    s->xb2    = malloc(sizeof(float) * c->dim);
+    s->q      = malloc(sizeof(float) * qdim);
+    s->k      = malloc(sizeof(float) * kvdim);
+    s->v      = malloc(sizeof(float) * kvdim);
+    s->att    = malloc(sizeof(float) * c->n_heads * c->ctx_len);
+    s->hb     = malloc(sizeof(float) * c->ffn_dim);
+    s->hb2    = malloc(sizeof(float) * c->ffn_dim);
+    s->logits = malloc(sizeof(float) * c->n_vocab);
+    s->cos_t  = malloc(sizeof(float) * (c->head_dim / 2));
+    s->sin_t  = malloc(sizeof(float) * (c->head_dim / 2));
+    s->k_cache = malloc(sizeof(float) * cache);
+    s->v_cache = malloc(sizeof(float) * cache);
+    if (!s->x || !s->xb || !s->xb2 || !s->q || !s->k || !s->v || !s->att ||
+        !s->hb || !s->hb2 || !s->logits || !s->cos_t || !s->sin_t ||
+        !s->k_cache || !s->v_cache) {
+        state_free(s);
+        return fail("内存不足(KV 缓存过大? 可减小上下文长度)");
+    }
+    return 0;
 }
 
 /* 释放运行状态的全部缓冲 */
@@ -1890,6 +2027,13 @@ static int sample(const float *logits, int n, float temp, float top_p, ProbIdx *
 
 #ifndef TINYQWEN_LIB /* ---- 命令行专属: 选项结构与内核自检 ---- */
 
+/* 命令行工具的错误策略: 打印后直接退出进程。
+ * 只在命令行代码里使用 —— 库代码一律用 fail() 返回错误码。 */
+static void die(const char *msg) {
+    fprintf(stderr, "错误: %s\n", msg);
+    exit(1);
+}
+
 /* 运行时可调参数（命令行覆盖默认值） */
 typedef struct {
     const char *model_path;   /* GGUF 模型文件路径                         */
@@ -1987,9 +2131,21 @@ static double now_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-/* 把字符串 BPE 编码后追加到 token 数组尾部, 返回新的元素个数 */
+/* 把字符串 BPE 编码后追加到 token 数组尾部, 返回新的元素个数。
+ * 负值表示编码失败, 并且负值输入会原样透传 —— 调用方可以连续追加
+ * 多段之后只在最后检查一次(append_id 同理)。 */
 static int append_encoded(const Tokenizer *t, const char *s, int *toks, int n, int max) {
-    return n + tok_encode(t, s, toks + n, max - n);
+    if (n < 0) return n;
+    int r = tok_encode(t, s, toks + n, max - n);
+    return r < 0 ? r : n + r;
+}
+
+/* 追加单个 token id(特殊 token 直接按 id 插入, 不经过 BPE) */
+static int append_id(int *toks, int n, int max, int id) {
+    if (n < 0) return n;
+    if (n >= max) return fail("输入过长(token 数超出缓冲)");
+    toks[n] = id;
+    return n + 1;
 }
 
 /* 生成配置与单轮统计(命令行与库 API 共用的内部结构) */
@@ -2050,15 +2206,18 @@ static const char *RERANK_SYSTEM =
 static const char *DEFAULT_TASK =
     "Given a web search query, retrieve relevant passages that answer the query";
 
-/* 计算单个文本的嵌入向量, 写入 out[dim](已 L2 归一化) */
-static void embed_one(const Model *m, RunState *st, const Tokenizer *tok,
-                      const char *text, float *out) {
+/* 计算单个文本的嵌入向量, 写入 out[dim](已 L2 归一化)。
+ * 返回 0 成功, -1 失败(文本过长等)。 */
+static int embed_one(const Model *m, RunState *st, const Tokenizer *tok,
+                     const char *text, float *out) {
     enum { MAX_TOK = 8192 };
     static int ids[MAX_TOK];
     int n = tok_encode(tok, text, ids, MAX_TOK - 1);
+    if (n < 0) return -1;
     ids[n++] = tok->eos_id;  /* 嵌入取自末尾 EOS 位置(embedding 模型的
                                 eos_token 是 <|endoftext|>, 来自元数据) */
-    if (n > m->cfg.ctx_len) die("文本过长, 超出上下文长度(可用 -c 增大)");
+    if (n > m->cfg.ctx_len)
+        return fail("文本过长, 超出上下文长度(加载时增大 ctx_len / -c)");
 
     st->pos = 0;             /* 每个文本独立编码, 清空 KV 缓存 */
     for (int i = 0; i < n; i++) forward_hidden(m, st, ids[i], st->pos++);
@@ -2071,6 +2230,7 @@ static void embed_one(const Model *m, RunState *st, const Tokenizer *tok,
     for (int i = 0; i < m->cfg.dim; i++) ss += st->xb[i] * st->xb[i];
     float inv = 1.0f / sqrtf(ss > 0 ? ss : 1.0f);
     for (int i = 0; i < m->cfg.dim; i++) out[i] = st->xb[i] * inv;
+    return 0;
 }
 
 #ifndef TINYQWEN_LIB
@@ -2094,7 +2254,7 @@ static void embed_run(const Model *m, RunState *st, const Tokenizer *tok,
             t = qbuf;
         }
         double t0 = now_ms();
-        embed_one(m, st, tok, t, embs + (size_t)i * dim);
+        if (embed_one(m, st, tok, t, embs + (size_t)i * dim) < 0) die(g_err_msg);
         int pl = utf8_prefix_len(texts[i], 40);
         printf("[%d] 已编码 (%.2fs): %.*s%s\n", i, (now_ms() - t0) / 1000.0,
                pl, texts[i], texts[i][pl] ? "..." : "");
@@ -2125,7 +2285,8 @@ static void embed_run(const Model *m, RunState *st, const Tokenizer *tok,
 }
 #endif /* TINYQWEN_LIB */
 
-/* 计算一对 (查询, 文档) 的重排得分: P(yes | 模板) ∈ (0,1) */
+/* 计算一对 (查询, 文档) 的重排得分: P(yes | 模板) ∈ (0,1)。
+ * 失败返回负值(错误详情在 g_err_msg)。 */
 static float rerank_score(const Model *m, RunState *st, const Tokenizer *tok,
                           const char *task, const char *query, const char *doc,
                           int yes_id, int no_id) {
@@ -2137,28 +2298,30 @@ static float rerank_score(const Model *m, RunState *st, const Tokenizer *tok,
      * 与官方不同的切分), 特殊 token 用 id 直接插入 */
     size_t need = strlen(task) + strlen(query) + strlen(doc) + 64;
     char *content = malloc(need);
-    if (!content) die("内存不足");
+    if (!content) return (float)fail("内存不足");
     snprintf(content, need, "<Instruct>: %s\n<Query>: %s\n<Document>: %s",
              task, query, doc);
 
-    ids[n++] = tok->im_start_id;                             /* 系统消息   */
+    n = append_id(ids, n, MAX_TOK, tok->im_start_id);        /* 系统消息   */
     n = append_encoded(tok, "system\n", ids, n, MAX_TOK);
     n = append_encoded(tok, RERANK_SYSTEM, ids, n, MAX_TOK);
-    ids[n++] = tok->im_end_id;
-    ids[n++] = tok->nl_id;
-    ids[n++] = tok->im_start_id;                             /* 用户消息   */
+    n = append_id(ids, n, MAX_TOK, tok->im_end_id);
+    n = append_id(ids, n, MAX_TOK, tok->nl_id);
+    n = append_id(ids, n, MAX_TOK, tok->im_start_id);        /* 用户消息   */
     n = append_encoded(tok, "user\n", ids, n, MAX_TOK);
     n = append_encoded(tok, content, ids, n, MAX_TOK - 32);
-    ids[n++] = tok->im_end_id;
-    ids[n++] = tok->nl_id;
-    ids[n++] = tok->im_start_id;                             /* 助手开头   */
+    n = append_id(ids, n, MAX_TOK, tok->im_end_id);
+    n = append_id(ids, n, MAX_TOK, tok->nl_id);
+    n = append_id(ids, n, MAX_TOK, tok->im_start_id);        /* 助手开头   */
     n = append_encoded(tok, "assistant\n", ids, n, MAX_TOK);
-    ids[n++] = tok->think_id;                                /* 空思考块   */
+    n = append_id(ids, n, MAX_TOK, tok->think_id);           /* 空思考块   */
     n = append_encoded(tok, "\n\n", ids, n, MAX_TOK);
-    ids[n++] = tok->think_end_id;
+    n = append_id(ids, n, MAX_TOK, tok->think_end_id);
     n = append_encoded(tok, "\n\n", ids, n, MAX_TOK);
     free(content);
-    if (n > m->cfg.ctx_len) die("查询+文档过长, 超出上下文长度(可用 -c 增大)");
+    if (n < 0) return -1.0f; /* 编码失败, 错误信息已设置 */
+    if (n > m->cfg.ctx_len)
+        return (float)fail("查询+文档过长, 超出上下文长度(加载时增大 ctx_len / -c)");
 
     /* 前 n-1 个 token 只需隐状态, 最后一个才需要 logits(省词表投影) */
     st->pos = 0;
@@ -2188,6 +2351,7 @@ static void rerank_run(const Model *m, RunState *st, const Tokenizer *tok,
     for (int i = 0; i < n_docs; i++) {
         double t0 = now_ms();
         scores[i] = rerank_score(m, st, tok, task, query, args[1 + i], yes_id, no_id);
+        if (scores[i] < 0) die(g_err_msg);
         order[i] = i;
         int pl = utf8_prefix_len(args[1 + i], 50);
         printf("  文档[%d] 得分 %.4f (%.2fs): %.*s%s\n", i, scores[i],
@@ -2228,32 +2392,31 @@ static int chat_turn(const Model *m, RunState *st, const Tokenizer *tok,
     static int ptoks[MAX_PROMPT];
     int np = 0;
 
-    /* ---- 1. 组装本轮的 prompt token 序列 ---- */
+    /* ---- 1. 组装本轮的 prompt token 序列 ----
+     * append_* 系列对负值(错误)透传, 最后统一检查一次即可 */
     if (st->pos > 0) {                       /* 非首轮: 补上一轮的收尾      */
-        ptoks[np++] = tok->im_end_id;
-        ptoks[np++] = tok->nl_id;
+        np = append_id(ptoks, np, MAX_PROMPT, tok->im_end_id);
+        np = append_id(ptoks, np, MAX_PROMPT, tok->nl_id);
     }
-    ptoks[np++] = tok->im_start_id;
+    np = append_id(ptoks, np, MAX_PROMPT, tok->im_start_id);
     np = append_encoded(tok, "user\n", ptoks, np, MAX_PROMPT);
     np = append_encoded(tok, user_text, ptoks, np, MAX_PROMPT - 32);
-    ptoks[np++] = tok->im_end_id;
-    ptoks[np++] = tok->nl_id;
-    ptoks[np++] = tok->im_start_id;
+    np = append_id(ptoks, np, MAX_PROMPT, tok->im_end_id);
+    np = append_id(ptoks, np, MAX_PROMPT, tok->nl_id);
+    np = append_id(ptoks, np, MAX_PROMPT, tok->im_start_id);
     np = append_encoded(tok, "assistant\n", ptoks, np, MAX_PROMPT);
     if (!gc->think && tok->think_id >= 0 && tok->think_end_id >= 0) {
         /* 空思考块 = 关闭思考模式(Qwen3 约定) */
-        ptoks[np++] = tok->think_id;
+        np = append_id(ptoks, np, MAX_PROMPT, tok->think_id);
         np = append_encoded(tok, "\n\n", ptoks, np, MAX_PROMPT);
-        ptoks[np++] = tok->think_end_id;
+        np = append_id(ptoks, np, MAX_PROMPT, tok->think_end_id);
         np = append_encoded(tok, "\n\n", ptoks, np, MAX_PROMPT);
     }
+    if (np < 0) return -1; /* 编码失败(输入过长等), 错误信息已设置 */
 
     /* ---- 2. 上下文容量检查 ---- */
-    if (np + 8 > c->ctx_len) {
-        snprintf(g_err_msg, sizeof(g_err_msg),
-                 "输入过长, 超出上下文长度上限(加载时增大 ctx_len / -c)");
-        return -1;
-    }
+    if (np + 8 > c->ctx_len)
+        return fail("输入过长, 超出上下文长度上限(加载时增大 ctx_len / -c)");
     if (st->pos + np + 8 > c->ctx_len) {
         /* 历史 + 新输入放不下: 清空对话历史重新开始(仅在有历史时发生) */
         st->pos = 0;
@@ -2307,54 +2470,51 @@ struct TqModel {
 };
 
 /* 进程级运行时(f16 查找表 / 线程池 / SIMD 检测)只初始化一次;
- * 线程池规模以第一次调用为准(见 tinyqwen.h 的线程安全说明) */
+ * 线程池规模以第一次调用为准(见 tinyqwen.h 的线程安全说明)。
+ * 返回 0 成功, -1 失败(线程池创建失败)。 */
 static int g_runtime_ready = 0;
 
-static void runtime_init(int n_threads, int no_simd) {
-    if (g_runtime_ready) return;
+static int runtime_init(int n_threads, int no_simd) {
+    if (g_runtime_ready) return 0;
     if (n_threads <= 0) {
         n_threads = cpu_count();
         if (n_threads > 32) n_threads = 32; /* 收益递减, 更高并行度需显式指定 */
     }
-    pool_init(n_threads);
+    if (pool_init(n_threads) < 0) return -1;
     atexit(pool_shutdown);   /* 进程退出时回收工作线程 */
     simd_init(!no_simd);
     f16_table_init();
     g_rng_state = (uint64_t)time(NULL) | 1; /* 默认种子(xorshift 状态不可为 0) */
     g_runtime_ready = 1;
+    return 0;
 }
 
 const char *tq_last_error(void) { return g_err_msg; }
 
 TqModel *tq_load(const char *gguf_path, const TqLoadParams *params) {
-    /* setjmp 之前把参数拷贝成值(避免 longjmp 破坏寄存器中的指针参数) */
     TqLoadParams p = {0};
     if (params) p = *params;
-    TqModel *volatile h = NULL;  /* volatile: 保证 longjmp 后读到最新值 */
 
     if (!gguf_path) {
-        snprintf(g_err_msg, sizeof(g_err_msg), "模型路径为空");
+        fail("模型路径为空");
         return NULL;
     }
-    if (setjmp(g_err_jmp)) {     /* 内部任何 die() 都会跳回这里 */
-        g_err_catch = 0;
-        tq_free((TqModel *)h);   /* 释放已成形的部分(calloc 保证可安全释放) */
-        return NULL;
-    }
-    g_err_catch = 1;
+    if (runtime_init(p.n_threads, p.no_simd) < 0) return NULL;
 
-    runtime_init(p.n_threads, p.no_simd);
-    h = calloc(1, sizeof(TqModel));
-    if (!h) die("内存不足");
-    h->gguf  = gguf_open(gguf_path);
-    h->tok   = tok_init(&h->gguf);
-    h->model = model_load(&h->gguf, p.ctx_len > 0 ? p.ctx_len : 4096);
-    h->st    = state_alloc(&h->model.cfg);
-    h->sbuf  = malloc(sizeof(ProbIdx) * h->model.cfg.n_vocab);
-    if (!h->sbuf) die("内存不足");
+    /* 逐步构建, 任何一步失败都释放已成形的部分(calloc 保证可安全释放) */
+    TqModel *h = calloc(1, sizeof(TqModel));
+    if (!h) { fail("内存不足"); return NULL; }
+    if (gguf_open(&h->gguf, gguf_path) < 0)                             goto bad;
+    if (tok_init(&h->tok, &h->gguf) < 0)                                goto bad;
+    if (model_load(&h->model, &h->gguf, p.ctx_len > 0 ? p.ctx_len : 4096) < 0) goto bad;
+    if (state_alloc(&h->st, &h->model.cfg) < 0)                         goto bad;
+    h->sbuf = malloc(sizeof(ProbIdx) * h->model.cfg.n_vocab);
+    if (!h->sbuf) { fail("内存不足"); goto bad; }
+    return h;
 
-    g_err_catch = 0;
-    return (TqModel *)h;
+bad:
+    tq_free(h);
+    return NULL;
 }
 
 void tq_free(TqModel *m) {
@@ -2373,10 +2533,7 @@ void tq_reset(TqModel *m) { if (m) m->st.pos = 0; }
 
 int tq_chat(TqModel *m, const char *user_text, const TqGenParams *gen,
             TqTokenFn on_token, void *userdata) {
-    if (!m || !user_text) {
-        snprintf(g_err_msg, sizeof(g_err_msg), "参数为空");
-        return -1;
-    }
+    if (!m || !user_text) return fail("参数为空");
     TqGenParams def = {0};
     const TqGenParams *g = gen ? gen : &def;
     GenCfg gc;
@@ -2387,57 +2544,38 @@ int tq_chat(TqModel *m, const char *user_text, const TqGenParams *gen,
     gc.think   = g->think;
     if (g->seed) g_rng_state = g->seed;
 
-    if (setjmp(g_err_jmp)) { g_err_catch = 0; return -1; }
-    g_err_catch = 1;
     TurnStats ts = {0};
-    int rc = chat_turn(&m->model, &m->st, &m->tok, &gc, m->sbuf, user_text,
-                       on_token, userdata, &ts);
-    g_err_catch = 0;
-    if (rc < 0) return -1;
+    if (chat_turn(&m->model, &m->st, &m->tok, &gc, m->sbuf, user_text,
+                  on_token, userdata, &ts) < 0)
+        return -1;
     return ts.history_cleared ? 1 : 0;
 }
 
 int tq_embed(TqModel *m, const char *text, const char *instruct, float *out) {
-    if (!m || !text || !out) {
-        snprintf(g_err_msg, sizeof(g_err_msg), "参数为空");
-        return -1;
-    }
-    if (setjmp(g_err_jmp)) { g_err_catch = 0; return -1; }
-    g_err_catch = 1;
-    if (instruct) {
-        /* 官方查询模板包装 */
-        size_t need = strlen(instruct) + strlen(text) + 32;
-        char *buf = malloc(need);
-        if (!buf) die("内存不足");
-        snprintf(buf, need, "Instruct: %s\nQuery:%s", instruct, text);
-        embed_one(&m->model, &m->st, &m->tok, buf, out);
-        free(buf);
-    } else {
-        embed_one(&m->model, &m->st, &m->tok, text, out);
-    }
-    g_err_catch = 0;
-    return 0;
+    if (!m || !text || !out) return fail("参数为空");
+    if (!instruct)
+        return embed_one(&m->model, &m->st, &m->tok, text, out);
+
+    /* 官方查询模板包装 */
+    size_t need = strlen(instruct) + strlen(text) + 32;
+    char *buf = malloc(need);
+    if (!buf) return fail("内存不足");
+    snprintf(buf, need, "Instruct: %s\nQuery:%s", instruct, text);
+    int rc = embed_one(&m->model, &m->st, &m->tok, buf, out);
+    free(buf);
+    return rc;
 }
 
 float tq_rerank(TqModel *m, const char *query, const char *document,
                 const char *instruct) {
-    if (!m || !query || !document) {
-        snprintf(g_err_msg, sizeof(g_err_msg), "参数为空");
-        return -1.0f;
-    }
+    if (!m || !query || !document) return (float)fail("参数为空");
     int yes_id = strmap_get(&m->tok.vocab_map, "yes");
     int no_id  = strmap_get(&m->tok.vocab_map, "no");
-    if (yes_id < 0 || no_id < 0) {
-        snprintf(g_err_msg, sizeof(g_err_msg), "词表中找不到 yes/no token");
-        return -1.0f;
-    }
-    if (setjmp(g_err_jmp)) { g_err_catch = 0; return -1.0f; }
-    g_err_catch = 1;
-    float s = rerank_score(&m->model, &m->st, &m->tok,
-                           instruct ? instruct : DEFAULT_TASK,
-                           query, document, yes_id, no_id);
-    g_err_catch = 0;
-    return s;
+    if (yes_id < 0 || no_id < 0)
+        return (float)fail("词表中找不到 yes/no token");
+    return rerank_score(&m->model, &m->st, &m->tok,
+                        instruct ? instruct : DEFAULT_TASK,
+                        query, document, yes_id, no_id);
 }
 
 /* ===========================================================================
@@ -2557,11 +2695,13 @@ int main(int argc, char **argv) {
     /* 进程级运行时初始化(线程池/SIMD 检测/f16 表), 与库 API 共用。
      * 线程数: -j 显式指定, 或自动取 min(核数, 32) —— matvec 行数只有
      * 1~3 千, 线程更多时每份工作变小、同步开销占比上升, 收益递减。 */
-    runtime_init(opt.n_threads, opt.no_simd);
+    if (runtime_init(opt.n_threads, opt.no_simd) < 0) die(g_err_msg);
     int n_threads = g_pool.n_threads;
 
-    /* ---- 打开并解析 GGUF 模型文件 ---- */
-    Gguf gguf = gguf_open(opt.model_path);
+    /* ---- 打开并解析 GGUF 模型文件 ----
+     * 内部函数一律返回错误码; 命令行工具的策略是"检查到失败即退出" */
+    Gguf gguf;
+    if (gguf_open(&gguf, opt.model_path) < 0) die(g_err_msg);
     const GgufKV *name_kv = gguf_kv(&gguf, "general.name");
     printf("已加载 %s: %.*s, 架构 %s, %llu 个张量\n",
            opt.model_path,
@@ -2572,7 +2712,8 @@ int main(int argc, char **argv) {
     if (opt.selftest) { kernel_selftest(&gguf); return 0; }
 
     /* ---- 构建分词器 ---- */
-    Tokenizer tok = tok_init(&gguf);
+    Tokenizer tok;
+    if (tok_init(&tok, &gguf) < 0) die(g_err_msg);
     printf("分词器: %d 词表项, eos=%d, im_start=%d, im_end=%d\n",
            tok.n_vocab, tok.eos_id, tok.im_start_id, tok.im_end_id);
 
@@ -2580,6 +2721,7 @@ int main(int argc, char **argv) {
         /* 分词器自检: 编码 -> 打印 token -> 解码 -> 与原文比对 */
         int ids[4096];
         int n = tok_encode(&tok, opt.test_text, ids, 4096);
+        if (n < 0) die(g_err_msg);
         printf("编码为 %d 个 token:\n", n);
         char buf[256];
         char *recon = calloc(1, strlen(opt.test_text) * 2 + 16);
@@ -2595,7 +2737,8 @@ int main(int argc, char **argv) {
     }
 
     /* ---- 加载模型权重、分配运行状态 ---- */
-    Model model = model_load(&gguf, opt.ctx_len);
+    Model model;
+    if (model_load(&model, &gguf, opt.ctx_len) < 0) die(g_err_msg);
     const Config *cfg = &model.cfg;
     size_t kv_bytes = 2ull * cfg->n_layers * cfg->ctx_len
                           * cfg->n_kv_heads * cfg->head_dim * sizeof(float);
@@ -2613,7 +2756,8 @@ int main(int argc, char **argv) {
            g_use_avx2 ? "AVX2+FMA(运行时检测)"
                       : (opt.no_simd ? "已禁用(--no-simd)" : "不支持, 用标量内核"));
 
-    RunState st = state_alloc(cfg);
+    RunState st;
+    if (state_alloc(&st, cfg) < 0) die(g_err_msg);
     ProbIdx *sbuf = malloc(sizeof(ProbIdx) * cfg->n_vocab); /* 采样工作区 */
     if (!sbuf) die("内存不足");
     g_rng_state = opt.seed ? opt.seed : 0x9E3779B97F4A7C15ull; /* 种子不可为 0 */

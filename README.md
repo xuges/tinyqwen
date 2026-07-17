@@ -79,8 +79,9 @@ gcc -O2 -o app app.c libtinyqwen.a -lm -pthread
 gcc -O2 -o app app.c -L. -ltinyqwen -lm -pthread
 ```
 
-要点：加载失败返回 NULL 而不是杀死宿主进程（内部错误经 `setjmp/longjmp`
-折返到 API 边界）；单个句柄不可并发调用；进程内多个句柄共享线程池。
+要点：内部函数统一返回错误码并逐层向上传递——库调用失败返回 NULL/负值
+（描述见 `tq_last_error()`），永远不会杀死宿主进程；只有命令行工具在检查到
+错误后才打印并退出。单个句柄不可并发调用；进程内多个句柄共享线程池。
 `-DTINYQWEN_LIB` 只是去掉 `main()`，库与命令行工具共用同一份实现。
 
 ## 获取模型
