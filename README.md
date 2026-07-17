@@ -16,8 +16,9 @@
   覆盖官方 Q4_0 与 Q8_0 量化文件的全部张量组合
 - **原生多线程**：自带跨平台线程池（POSIX pthread / Win32 线程双实现，不依赖 OpenMP），
   线程数用 `-j` 指定，默认自动取 min(核数, 32)
-- **AVX2 运行时检测**：启动时用 CPUID 检测 CPU 是否支持 AVX2+FMA，支持则切换到
-  SIMD 点积内核（约 3~11 倍提速），不支持自动退回标量路径——同一个二进制到处能跑
+- **SIMD 运行时检测**：x86 用 CPUID 检测 AVX2+FMA，aarch64 用 HWCAP 检测
+  NEON（本分支实验特性），支持则切换到向量化点积内核（x86 实测约 3~11 倍提速），
+  不支持自动退回标量路径——同一个二进制到处能跑
 - **命令行问答交互**：启动后加载模型，进入多轮对话 REPL（ChatML 模板 + KV 缓存记忆）
 - **嵌入与重排**：同一程序还支持 Qwen3-Embedding（文本向量/相似度）与
   Qwen3-Reranker（查询-文档相关性打分）模型
@@ -182,7 +183,8 @@ lm_head 词表投影），重排 = 官方 ChatML 模板下末位 logits 的 yes/
 | [2] 分词器 | GPT-2 风格字节级 BPE：字节↔Unicode 映射、哈希表、贪心合并编码、解码 |
 | [3] 模型加载 | 读取超参数、按名字定位 28 层权重、RoPE 频率表 |
 | [4] 数学内核 | Q4_0/Q4_1/Q6_K 反量化点积（热点）、RMSNorm、Softmax |
-| [4b] AVX2 内核 | CPUID 运行时检测；三种量化点积的 SIMD 版本，函数指针分发 |
+| [4b] AVX2 内核 | x86：CPUID 运行时检测；四种量化点积的 SIMD 版本，函数指针分发 |
+| [4c] NEON 内核 | aarch64（实验性）：HWCAP 运行时检测；同一组点积的 128 位 NEON 版本 |
 | [5] 前向传播 | QK-Norm、RoPE(NeoX)、GQA 因果注意力、KV 缓存、SwiGLU FFN |
 | [6] 采样器 | temperature + top-p 核采样，xorshift64* 随机数 |
 | [7] 聊天主循环 | ChatML 模板拼接、逐 token 流式回调生成 |
@@ -211,8 +213,22 @@ lm_head 词表投影），重排 = 官方 ChatML 模板下末位 logits 的 yes/
 | AVX2 单线程（`-j 1`） | ~12 tok/s | — |
 | 标量单线程（`-j 1 --no-simd`） | ~1 tok/s | — |
 
-标量内核保留为教学参考与非 x86 平台的兜底路径。`--selftest` 会用模型真实权重
-把标量与 AVX2 内核分别对照 double 精度参考值验证（误差均在 1e-7 量级）。
+标量内核保留为教学参考与未知平台的兜底路径。`--selftest` 会用模型真实权重
+把标量与 SIMD 内核分别对照 double 精度参考值验证（误差均在 1e-7 量级）。
+
+### aarch64 / NEON（本分支实验特性）
+
+NEON 是 armv8-a 的强制特性，无需编译开关，运行时经 Linux HWCAP 检测启用
+（Apple Silicon / Windows ARM64 按架构恒真），`--no-simd` 可强制标量。
+本分支的验证方式为交叉编译 + qemu 用户态模拟：
+
+```bash
+aarch64-linux-gnu-gcc -O2 -std=c99 -static -o tinyqwen-arm64 tinyqwen.c -lm -pthread
+qemu-aarch64 ./tinyqwen-arm64 models/Qwen3-0.6B-Q4_0.gguf --selftest   # NEON 内核数值校验
+```
+
+已验证：四种量化内核对 double 参考误差 1e-8 量级；贪心生成输出与标量/x86
+逐字一致。**尚未在真实 ARM 硬件上实测性能**（qemu 模拟不反映真机加速比）。
 
 ## 开发状态
 

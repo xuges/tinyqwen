@@ -43,7 +43,8 @@
  *     [2]  分词器             —— GPT-2 字节级 BPE 编码/解码
  *     [3]  模型加载           —— 读取超参数、按名字定位每层权重
  *     [4]  数学内核           —— 反量化点积（矩阵乘）、RMSNorm、Softmax
- *     [4b] AVX2 SIMD 内核     —— CPUID 运行时检测 + 向量化点积
+ *     [4b] AVX2 SIMD 内核     —— x86: CPUID 运行时检测 + 向量化点积
+ *     [4c] NEON SIMD 内核     —— aarch64: HWCAP 运行时检测（实验性）
  *     [5]  前向传播           —— 注意力(RoPE/GQA/QK-Norm) + SwiGLU + KV 缓存
  *     [6]  采样器             —— temperature + top-p 核采样
  *     [7]  聊天/嵌入/重排     —— ChatML 模板、逐 token 生成、池化、打分
@@ -1411,7 +1412,8 @@ static float dot_q6_k(const uint8_t *row, const float *x, int n) {
  *     自动退回标量路径, 不会崩溃;
  *   - 编译兼容: GCC/Clang 用 __attribute__((target("avx2,fma"))) 单独
  *     给这些函数开 AVX2 代码生成(整个文件仍按通用指令集编译), MSVC 则
- *     本来就允许直接使用 intrinsics; 非 x86 架构下整段代码不参与编译;
+ *     本来就允许直接使用 intrinsics; 非 x86 架构下本段代码不参与编译
+ *     (aarch64 的 NEON 内核见下方 [4c] 分支, 其它架构只有标量内核);
  *   - 依然零依赖: intrinsics 头文件 immintrin.h 是编译器自带的。
  *
  * 注: FMA(乘加融合)与标量代码的舍入次序不同, 结果可能有 1ulp 级微小
@@ -1419,7 +1421,7 @@ static float dot_q6_k(const uint8_t *row, const float *x, int n) {
  */
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-#define TINYLLM_X86 1
+#define TINYQWEN_X86 1
 #include <immintrin.h>
 
 #if defined(_MSC_VER)
@@ -1607,30 +1609,202 @@ TARGET_AVX2 static float dot_q6_k_avx2(const uint8_t *row, const float *x, int n
     return hsum8(acc);
 }
 
-#else  /* 非 x86 架构: 无 AVX2, 检测恒为否 */
-static int cpu_has_avx2_fma(void) { return 0; }
-#endif /* TINYLLM_X86 */
+#elif defined(__aarch64__) || defined(_M_ARM64)
+/* ===========================================================================
+ * [4c] AArch64 NEON 加速内核(实验性)
+ * ===========================================================================
+ *
+ * NEON(AdvSIMD) 是 armv8-a 的强制特性, 与 x86 的 AVX2 不同, 不需要
+ * 按函数的目标属性, 基线编译即可使用 intrinsics; 这里的运行时检测
+ * 主要是与 x86 路径保持同构(Linux 上真读 HWCAP, 其它系统按架构恒真),
+ * 并保留 --no-simd 强制标量的能力。
+ * NEON 是 128 位(AVX2 的一半宽): 一次算 4 个 float, 8bit 整数拓宽链是
+ * int8x16 -> 2x int16x8 -> 4x int32x4 -> 4x float32x4。
+ */
+#define TINYQWEN_AARCH64 1
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>   /* getauxval    */
+#include <asm/hwcap.h>  /* HWCAP_ASIMD  */
+#endif
+
+static int cpu_has_neon(void) {
+#if defined(__linux__) && defined(HWCAP_ASIMD)
+    return (getauxval(AT_HWCAP) & HWCAP_ASIMD) != 0;
+#else
+    return 1; /* Apple Silicon / Windows ARM64: NEON 架构必备 */
+#endif
+}
+
+/* 16 个 int8 与 16 个 float 的逐项乘积, 累加进 4 路求和向量 */
+static inline float32x4_t neon_dot16(float32x4_t sum, int8x16_t q, const float *xp) {
+    int16x8_t lo = vmovl_s8(vget_low_s8(q));   /* 低 8 字节拓宽到 16 位 */
+    int16x8_t hi = vmovl_s8(vget_high_s8(q));
+    sum = vfmaq_f32(sum, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),  vld1q_f32(xp));
+    sum = vfmaq_f32(sum, vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))), vld1q_f32(xp + 4));
+    sum = vfmaq_f32(sum, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),  vld1q_f32(xp + 8));
+    sum = vfmaq_f32(sum, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))), vld1q_f32(xp + 12));
+    return sum;
+}
+
+/* -- Q4_0 点积的 NEON 版: 与标量版逐块等价 -- */
+static float dot_q4_0_neon(const uint8_t *row, const float *x, int n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    const uint8x16_t mask4 = vdupq_n_u8(0x0F);
+    const int8x16_t  off8  = vdupq_n_s8(8);
+    for (int b = 0; b < n / 32; b++) {
+        const uint8_t *blk = row + b * 18;
+        uint16_t dh;
+        memcpy(&dh, blk, 2);
+        uint8x16_t qs = vld1q_u8(blk + 2);
+        /* 低/高半字节各 16 个值, 减 8 得有符号权重 */
+        int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(qs, mask4)), off8);
+        int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qs, 4)), off8);
+        const float *xb = x + b * 32;
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        sum = neon_dot16(sum, lo, xb);
+        sum = neon_dot16(sum, hi, xb + 16);
+        acc = vfmaq_f32(acc, sum, vdupq_n_f32(F16(dh)));
+    }
+    return vaddvq_f32(acc); /* 4 路横向求和 */
+}
+
+/* -- Q4_1 点积的 NEON 版: w = d·q + m, 分别累加 Σq·x 与 Σx -- */
+static float dot_q4_1_neon(const uint8_t *row, const float *x, int n) {
+    float32x4_t accq = vdupq_n_f32(0.0f); /* Σ d·(q·x) */
+    float32x4_t accx = vdupq_n_f32(0.0f); /* Σ m·x     */
+    const uint8x16_t mask4 = vdupq_n_u8(0x0F);
+    for (int b = 0; b < n / 32; b++) {
+        const uint8_t *blk = row + b * 20;
+        uint16_t dh, mh;
+        memcpy(&dh, blk, 2);
+        memcpy(&mh, blk + 2, 2);
+        uint8x16_t qs = vld1q_u8(blk + 4);
+        /* q 为无符号 0..15, 直接当 int8 用(不减偏移) */
+        int8x16_t lo = vreinterpretq_s8_u8(vandq_u8(qs, mask4));
+        int8x16_t hi = vreinterpretq_s8_u8(vshrq_n_u8(qs, 4));
+        const float *xb = x + b * 32;
+        float32x4_t sumq = vdupq_n_f32(0.0f);
+        sumq = neon_dot16(sumq, lo, xb);
+        sumq = neon_dot16(sumq, hi, xb + 16);
+        float32x4_t sumx = vaddq_f32(
+            vaddq_f32(vaddq_f32(vld1q_f32(xb),      vld1q_f32(xb + 4)),
+                      vaddq_f32(vld1q_f32(xb + 8),  vld1q_f32(xb + 12))),
+            vaddq_f32(vaddq_f32(vld1q_f32(xb + 16), vld1q_f32(xb + 20)),
+                      vaddq_f32(vld1q_f32(xb + 24), vld1q_f32(xb + 28))));
+        accq = vfmaq_f32(accq, sumq, vdupq_n_f32(F16(dh)));
+        accx = vfmaq_f32(accx, sumx, vdupq_n_f32(F16(mh)));
+    }
+    return vaddvq_f32(accq) + vaddvq_f32(accx);
+}
+
+/* -- Q8_0 点积的 NEON 版 -- */
+static float dot_q8_0_neon(const uint8_t *row, const float *x, int n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (int b = 0; b < n / 32; b++) {
+        const uint8_t *blk = row + b * 34;
+        uint16_t dh;
+        memcpy(&dh, blk, 2);
+        int8x16_t q0 = vld1q_s8((const int8_t *)(blk + 2));
+        int8x16_t q1 = vld1q_s8((const int8_t *)(blk + 18));
+        const float *xb = x + b * 32;
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        sum = neon_dot16(sum, q0, xb);
+        sum = neon_dot16(sum, q1, xb + 16);
+        acc = vfmaq_f32(acc, sum, vdupq_n_f32(F16(dh)));
+    }
+    return vaddvq_f32(acc);
+}
+
+/* -- Q6_K 点积的 NEON 版 --
+ * 6bit 值拼装与标量版一致; u8 的字节内移位天然干净(对比 AVX2 需要
+ * epi16 移位加掩码), 只有跨位段拼装处需要 &0x30。
+ * 每 16 个权重共享一个子缩放, 恰好一条 int8x16 一组。 */
+static float dot_q6_k_neon(const uint8_t *row, const float *x, int n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    const uint8x16_t mf    = vdupq_n_u8(0x0F);
+    const uint8x16_t m30   = vdupq_n_u8(0x30);
+    const int8x16_t  off32 = vdupq_n_s8(32);
+    for (int b = 0; b < n / 256; b++) {
+        const uint8_t *blk = row + b * 210;
+        const int8_t  *sc  = (const int8_t *)(blk + 192);
+        uint16_t dh;
+        memcpy(&dh, blk + 208, 2);
+        float d = F16(dh);
+        const float *xb = x + b * 256;
+
+        for (int half = 0; half < 2; half++) {     /* 每半 128 个权重 */
+            const uint8_t *pql = blk + half * 64;        /* ql 低位表  */
+            const uint8_t *pqh = blk + 128 + half * 32;  /* qh 高位表  */
+            const int8_t  *ps  = sc + half * 8;          /* 8 组子缩放 */
+            const float   *xh  = xb + half * 128;
+            for (int g = 0; g < 2; g++) {          /* 元素 l = g*16 .. g*16+15 */
+                uint8x16_t ql_lo = vld1q_u8(pql + g * 16);      /* ql[l]    */
+                uint8x16_t ql_hi = vld1q_u8(pql + 32 + g * 16); /* ql[l+32] */
+                uint8x16_t qh    = vld1q_u8(pqh + g * 16);      /* qh[l]    */
+                /* 四组 6bit 值, 与标量版 q1..q4 一一对应 */
+                uint8x16_t q1 = vorrq_u8(vandq_u8(ql_lo, mf),
+                                         vandq_u8(vshlq_n_u8(qh, 4), m30));
+                uint8x16_t q2 = vorrq_u8(vandq_u8(ql_hi, mf),
+                                         vandq_u8(vshlq_n_u8(qh, 2), m30));
+                uint8x16_t q3 = vorrq_u8(vshrq_n_u8(ql_lo, 4),
+                                         vandq_u8(qh, m30));
+                uint8x16_t q4 = vorrq_u8(vshrq_n_u8(ql_hi, 4),
+                                         vandq_u8(vshrq_n_u8(qh, 2), m30));
+                float32x4_t t;
+                t = neon_dot16(vdupq_n_f32(0.0f),
+                               vsubq_s8(vreinterpretq_s8_u8(q1), off32), xh + g * 16);
+                acc = vfmaq_f32(acc, t, vdupq_n_f32(d * ps[g]));
+                t = neon_dot16(vdupq_n_f32(0.0f),
+                               vsubq_s8(vreinterpretq_s8_u8(q2), off32), xh + 32 + g * 16);
+                acc = vfmaq_f32(acc, t, vdupq_n_f32(d * ps[2 + g]));
+                t = neon_dot16(vdupq_n_f32(0.0f),
+                               vsubq_s8(vreinterpretq_s8_u8(q3), off32), xh + 64 + g * 16);
+                acc = vfmaq_f32(acc, t, vdupq_n_f32(d * ps[4 + g]));
+                t = neon_dot16(vdupq_n_f32(0.0f),
+                               vsubq_s8(vreinterpretq_s8_u8(q4), off32), xh + 96 + g * 16);
+                acc = vfmaq_f32(acc, t, vdupq_n_f32(d * ps[6 + g]));
+            }
+        }
+    }
+    return vaddvq_f32(acc);
+}
+
+#endif /* 架构分支(x86 / aarch64; 其它架构只有标量内核) */
 
 /* ---- 点积内核的运行时分发 ----
- * 默认指向标量实现; simd_init() 检测到 AVX2+FMA 时切换到向量化实现。 */
+ * 默认指向标量实现; simd_init() 按架构检测到可用指令集时切换。 */
 typedef float (*DotFn)(const uint8_t *row, const float *x, int n);
 
 static DotFn g_dot_q4_0 = dot_q4_0;
 static DotFn g_dot_q4_1 = dot_q4_1;
 static DotFn g_dot_q6_k = dot_q6_k;
 static DotFn g_dot_q8_0 = dot_q8_0;
-static int   g_use_avx2 = 0;
+static int         g_use_simd  = 0;    /* 是否启用了 SIMD 内核    */
+static const char *g_simd_name = "无"; /* 启用的指令集名(显示用)  */
 
 /* 检测并启用 SIMD(allow=0 时强制标量, 对应 --no-simd) */
 static void simd_init(int allow) {
-    g_use_avx2 = allow && cpu_has_avx2_fma();
-#ifdef TINYLLM_X86
-    if (g_use_avx2) {
+#if defined(TINYQWEN_X86)
+    if (allow && cpu_has_avx2_fma()) {
+        g_use_simd  = 1;
+        g_simd_name = "AVX2+FMA";
         g_dot_q4_0 = dot_q4_0_avx2;
         g_dot_q4_1 = dot_q4_1_avx2;
         g_dot_q6_k = dot_q6_k_avx2;
         g_dot_q8_0 = dot_q8_0_avx2;
     }
+#elif defined(TINYQWEN_AARCH64)
+    if (allow && cpu_has_neon()) {
+        g_use_simd  = 1;
+        g_simd_name = "NEON";
+        g_dot_q4_0 = dot_q4_0_neon;
+        g_dot_q4_1 = dot_q4_1_neon;
+        g_dot_q6_k = dot_q6_k_neon;
+        g_dot_q8_0 = dot_q8_0_neon;
+    }
+#else
+    (void)allow; /* 其它架构: 恒用标量内核 */
 #endif
 }
 
@@ -2067,8 +2241,8 @@ typedef struct {
 /* --selftest: 用固定伪随机输入对比标量内核与 AVX2 内核的输出误差。
  * FMA 舍入次序不同会带来 1ulp 级差异, 相对误差应远小于 1e-4。 */
 static void kernel_selftest(const Gguf *g) {
-    if (!g_use_avx2) {
-        printf("selftest: 本机未启用 AVX2(或 --no-simd), 无需对比\n");
+    if (!g_use_simd) {
+        printf("selftest: 本机未启用 SIMD(或 --no-simd), 无需对比\n");
         return;
     }
     /* 动态扫描: 文件中每种有 SIMD 实现的量化类型, 各挑第一个张量作代表 */
@@ -2120,9 +2294,9 @@ static void kernel_selftest(const Gguf *g) {
         /* float 顺序累加的理论误差量级 ~ sqrt(n)*eps ≈ 1e-6, 阈值放宽到 1e-5 */
         int ok = max_scalar < 1e-5 && max_simd < 1e-5;
         all_ok &= ok;
-        printf("selftest %-22s %-5s %d 行, 对 double 参考误差: 标量 %.1e, AVX2 %.1e %s\n",
-               w->name, ggml_type_name(w->type), n_rows, max_scalar, max_simd,
-               ok ? "通过" : "失败!");
+        printf("selftest %-22s %-5s %d 行, 对 double 参考误差: 标量 %.1e, %s %.1e %s\n",
+               w->name, ggml_type_name(w->type), n_rows, max_scalar,
+               g_simd_name, max_simd, ok ? "通过" : "失败!");
         free(x);
         free(wrow);
     }
@@ -2793,14 +2967,15 @@ int main(int argc, char **argv) {
            cfg->n_layers, cfg->dim, cfg->n_heads, cfg->n_kv_heads,
            cfg->head_dim, cfg->ffn_dim, cfg->n_vocab,
            cfg->ctx_len, kv_bytes / 1048576.0);
-    printf("线程: %d (%s, -j 可调) · SIMD: %s\n", n_threads,
+    printf("线程: %d (%s, -j 可调) · SIMD: %s%s\n", n_threads,
 #ifdef _WIN32
            "Win32 原生线程",
 #else
            "POSIX pthread",
 #endif
-           g_use_avx2 ? "AVX2+FMA(运行时检测)"
-                      : (opt.no_simd ? "已禁用(--no-simd)" : "不支持, 用标量内核"));
+           g_use_simd ? g_simd_name
+                      : (opt.no_simd ? "已禁用(--no-simd)" : "不支持, 用标量内核"),
+           g_use_simd ? "(运行时检测)" : "");
 
     RunState st;
     if (state_alloc(&st, cfg) < 0) die(g_err_msg);
